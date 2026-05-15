@@ -1,0 +1,216 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr: none
+
+parameters:
+  - name: deployEnvironment
+    displayName: Deployment color
+    type: string
+    default: green
+    values:
+      - blue
+      - green
+  - name: failHealthcheck
+    displayName: Simulate failed deployment
+    type: boolean
+    default: false
+
+variables:
+  - name: vmImage
+    value: ubuntu-latest
+  - name: buildConfiguration
+    value: Release
+  - name: azureServiceConnection
+    value: blue-green-connection
+  - name: resourceGroup
+    value: crisan-devops
+  - name: containerAppName
+    value: bluegreen-api
+  - name: acrName
+    value: crisanregistry
+  - name: acrLoginServer
+    value: crisanregistry.azurecr.io
+  - name: imageRepository
+    value: bluegreen-api
+
+stages:
+  - stage: Build
+    displayName: Build and push image
+    jobs:
+      - job: BuildPush
+        pool:
+          vmImage: $(vmImage)
+        steps:
+          - checkout: self
+
+          - task: UseDotNet@2
+            displayName: Use .NET SDK 10.x
+            inputs:
+              packageType: sdk
+              version: 10.x
+
+          - script: dotnet restore src/BlueGreenApi/BlueGreenApi.csproj
+            displayName: Restore
+
+          - script: dotnet build src/BlueGreenApi/BlueGreenApi.csproj -c $(buildConfiguration) --no-restore
+            displayName: Build
+
+          - task: AzureCLI@2
+            displayName: Build and push image to ACR
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                az acr login --name $(acrName)
+
+                IMAGE_TAG="$(Build.BuildId)"
+                IMAGE_SHA_TAG="$(Build.SourceVersion)"
+
+                docker build \
+                  -t $(acrLoginServer)/$(imageRepository):${IMAGE_TAG} \
+                  -t $(acrLoginServer)/$(imageRepository):${IMAGE_SHA_TAG} \
+                  -t $(acrLoginServer)/$(imageRepository):latest \
+                  .
+
+                docker push $(acrLoginServer)/$(imageRepository):${IMAGE_TAG}
+                docker push $(acrLoginServer)/$(imageRepository):${IMAGE_SHA_TAG}
+                docker push $(acrLoginServer)/$(imageRepository):latest
+
+  - stage: Deploy
+    displayName: Deploy, verify, and rollback if needed
+    dependsOn: Build
+    jobs:
+      - job: BlueGreenRollout
+        pool:
+          vmImage: $(vmImage)
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Blue/Green deployment with health-gated traffic switch
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                az extension add --name containerapp --upgrade --allow-preview true
+
+                # Enforce multiple revisions mode for blue/green behavior.
+                az containerapp revision set-mode \
+                  --resource-group $(resourceGroup) \
+                  --name $(containerAppName) \
+                  --mode multiple
+
+                # Find current revision receiving traffic so we can rollback if needed.
+                STABLE_REVISION=$(az containerapp ingress traffic show \
+                  --resource-group $(resourceGroup) \
+                  --name $(containerAppName) \
+                  --query '[?weight > `0`][0].revisionName' \
+                  -o tsv || true)
+
+                IMAGE_TAG="$(Build.BuildId)"
+                IMAGE="$(acrLoginServer)/$(imageRepository):${IMAGE_TAG}"
+                REV_SUFFIX="r$(Build.BuildId)"
+                FAIL_FLAG="${{ parameters.failHealthcheck }}"
+                DEPLOY_COLOR="${{ parameters.deployEnvironment }}"
+                VERSION_VALUE="$(Build.SourceVersion)"
+
+                echo "Stable revision before deployment: ${STABLE_REVISION:-<none>}"
+
+                az containerapp update \
+                  --resource-group $(resourceGroup) \
+                  --name $(containerAppName) \
+                  --image "$IMAGE" \
+                  --revision-suffix "$REV_SUFFIX" \
+                  --set-env-vars VERSION="$VERSION_VALUE" ENVIRONMENT="$DEPLOY_COLOR" FAIL_HEALTHCHECK="$FAIL_FLAG"
+
+                NEW_REVISION=$(az containerapp revision list \
+                  --resource-group $(resourceGroup) \
+                  --name $(containerAppName) \
+                  --query "sort_by([].{name:name,created:properties.createdTime}, &created)[-1].name" \
+                  -o tsv)
+
+                echo "Candidate revision: ${NEW_REVISION}"
+
+                # Keep production traffic on blue/stable while validating green/candidate.
+                if [[ -n "${STABLE_REVISION}" ]]; then
+                  az containerapp ingress traffic set \
+                    --resource-group $(resourceGroup) \
+                    --name $(containerAppName) \
+                    --revision-weight "${STABLE_REVISION}=100"
+                fi
+
+                # Health-check candidate revision URL before switching production traffic.
+                REVISION_FQDN=$(az containerapp revision show \
+                  --resource-group $(resourceGroup) \
+                  --name $(containerAppName) \
+                  --revision "$NEW_REVISION" \
+                  --query "properties.fqdn" \
+                  -o tsv)
+
+                HEALTH_URL="https://${REVISION_FQDN}/health"
+                echo "Health URL: ${HEALTH_URL}"
+
+                HEALTHY=false
+                for attempt in {1..12}; do
+                  STATUS=$(curl -s -o /tmp/health.txt -w "%{http_code}" "$HEALTH_URL" || true)
+                  BODY=$(cat /tmp/health.txt)
+                  echo "Attempt ${attempt}: HTTP ${STATUS}, body='${BODY}'"
+
+                  if [[ "$STATUS" == "200" ]]; then
+                    HEALTHY=true
+                    break
+                  fi
+
+                  sleep 5
+                done
+
+                if [[ "$HEALTHY" == "true" ]]; then
+                  echo "Candidate revision is healthy. Switching traffic to ${NEW_REVISION}."
+                  az containerapp ingress traffic set \
+                    --resource-group $(resourceGroup) \
+                    --name $(containerAppName) \
+                    --revision-weight "${NEW_REVISION}=100"
+
+                  # Labels make it easy to show stable/candidate revisions during demos.
+                  az containerapp revision label add \
+                    --resource-group $(resourceGroup) \
+                    --name $(containerAppName) \
+                    --revision "$NEW_REVISION" \
+                    --label stable || true
+                  echo "Traffic switch complete."
+                else
+                  echo "Candidate revision failed health checks."
+
+                  if [[ -n "${STABLE_REVISION}" ]]; then
+                    echo "Rolling back traffic to ${STABLE_REVISION}."
+                    az containerapp ingress traffic set \
+                      --resource-group $(resourceGroup) \
+                      --name $(containerAppName) \
+                      --revision-weight "${STABLE_REVISION}=100"
+
+                    az containerapp revision label add \
+                      --resource-group $(resourceGroup) \
+                      --name $(containerAppName) \
+                      --revision "$STABLE_REVISION" \
+                      --label stable || true
+                  else
+                    echo "No stable revision available for rollback (first deployment)."
+                  fi
+
+                  az containerapp revision deactivate \
+                    --resource-group $(resourceGroup) \
+                    --name $(containerAppName) \
+                    --revision "$NEW_REVISION" || true
+
+                  echo "Rollback complete. Marking deployment as failed."
+                  exit 1
+                fi

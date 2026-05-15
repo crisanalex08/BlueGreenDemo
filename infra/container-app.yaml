@@ -1,0 +1,57 @@
+# Azure Container Apps definition used as a baseline for first app creation.
+# Runtime deployments are performed by azure-pipelines.yml using az containerapp update.
+name: bluegreen-api
+type: Microsoft.App/containerApps
+location: eastus
+properties:
+  managedEnvironmentId: /subscriptions/ba8a2c34-9f22-4875-a0f4-4180eb645425/resourceGroups/<RESOURCE_GROUP>/providers/Microsoft.App/managedEnvironments/<CONTAINERAPPS_ENVIRONMENT>
+  configuration:
+    activeRevisionsMode: Multiple
+    ingress:
+      external: true
+      targetPort: 8080
+      transport: auto
+      allowInsecure: false
+      traffic:
+        - latestRevision: true
+          weight: 100
+    registries:
+      - server: <ACR_LOGIN_SERVER>
+        username: <ACR_USERNAME>
+        passwordSecretRef: acr-password
+    secrets:
+      - name: acr-password
+        value: <ACR_PASSWORD>
+  template:
+    revisionSuffix: blue-v1
+    containers:
+      - name: bluegreen-api
+        image: <ACR_LOGIN_SERVER>/bluegreen-api:v1
+        env:
+          - name: VERSION
+            value: v1
+          - name: ENVIRONMENT
+            value: blue
+          - name: FAIL_HEALTHCHECK
+            value: "false"
+        resources:
+          cpu: 0.25
+          memory: 0.5Gi
+        probes:
+          - type: Liveness
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          - type: Readiness
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+    scale:
+      minReplicas: 1
+      maxReplicas: 3

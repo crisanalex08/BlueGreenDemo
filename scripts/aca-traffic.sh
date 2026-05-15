@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
-  echo "Usage: $0 <resource-group> <container-app-name>"
+  echo "Usage: $0 crisan-devops crisan-bluegreen-ca"
   exit 1
 fi
 
